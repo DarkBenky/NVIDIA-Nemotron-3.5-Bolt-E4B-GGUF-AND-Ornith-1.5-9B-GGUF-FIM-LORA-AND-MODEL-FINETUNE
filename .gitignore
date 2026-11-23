@@ -1,3 +1,4 @@
 env.py
-out
+out/
 __pycache__/
+wandb/
