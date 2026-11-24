@@ -14,6 +14,7 @@ BASE = MODEL_PATH_SAVE_TENSOR
 FIM_LEN = 4096
 MAXLEN = FIM_LEN
 ACCUM = 16
+SHUFFLE = 256
 EXT = (".c", ".h", ".go", ".py", ".vue", ".sql", ".js", ".ts", ".html", ".cpp", ".rs")
 
 def loadBase(check=True):
@@ -55,28 +56,39 @@ def chunkLoss(h, w, labels, chunk=512):
     # a chunk of C costs C*vocab*4 bytes three times over (logits, log_softmax, grad): 2048 -> ~6 GB spike
     # total starts as a graph-connected zero: an all-masked sample leaves it untouched, and a plain 0.0
     # would make backward() fail because a float has no grad
-    total, count = h.sum() * 0, 0
+    total, count, correct, exact = h.sum() * 0, 0, 0, True
     def f(hh, yy):
         logits = (hh @ w.T).float()
         if cap:
             logits = torch.tanh(logits / cap) * cap
-        return torch.nn.functional.cross_entropy(logits, yy, ignore_index=-100, reduction="sum")
+        loss = torch.nn.functional.cross_entropy(logits, yy, ignore_index=-100, reduction="sum")
+        hit = (logits.argmax(-1) == yy) & (yy != -100)
+        return loss, hit.sum(), (hit | (yy == -100)).all()
     for i in range(0, h.size(0), chunk):
         y = labels[i:i + chunk]
         n = (y != -100).sum().item()
         if n == 0:
             continue
-        total = total + checkpoint(f, h[i:i + chunk], y, use_reentrant=False)
+        loss, hits, em = checkpoint(f, h[i:i + chunk], y, use_reentrant=False)
+        total = total + loss
+        correct += int(hits)
+        exact = exact and bool(em)
         count += n
-    return total / max(count, 1)
+    return total / max(count, 1), correct, count, exact
 
 def codeStream():
+    # the dataset arrives repo by repo, so a small buffer shuffle breaks the long runs of similar files
     ds = load_dataset("HuggingFaceCode/stack-v3-train", split="train", streaming=True, token=HF_TOKEN)
+    buf = []
     for repo in ds:
         for f in repo["files"]:
             code = f.get("content")
             if code and (f.get("file_path") or "").endswith(EXT) and 300 < len(code) < 60000:
-                yield code[:MAXLEN * 3]
+                buf.append(code[:MAXLEN * 3])
+                if len(buf) >= SHUFFLE:
+                    yield buf.pop(random.randrange(len(buf)))
+    random.shuffle(buf)
+    yield from buf
 
 def makeFim(code):
     # chars per token is ~3 here, so a window of FIM_CHARS chars yields roughly FIM_LEN tokens
@@ -93,23 +105,33 @@ def trainStep(ids, labels):
     ids = torch.tensor([ids]).cuda()
     labels = torch.tensor(labels[1:] + [-100]).cuda()
     h = backbone(input_ids=ids).last_hidden_state[0]
-    loss = chunkLoss(h, headW, labels)
+    loss, correct, tokens, exact = chunkLoss(h, headW, labels)
     (loss / ACCUM).backward()
-    return loss.item()
+    return loss.item(), correct, tokens, exact
 
 if __name__ == "__main__":
-    wb.init(project="nemotron-fim-lora")
+    runId = os.environ.get("WANDB_RUN_ID")
+    stepBase = int(os.environ.get("STEP_OFFSET", 0))
+    wb.init(project="nemotron-fim-lora", id=runId, resume="allow" if runId else None)
     print("Starting training...")
+    lossSum, correctSum, tokenSum, emSum = 0.0, 0, 0, 0
     for step, code in enumerate(codeStream()):
         ids, labels = makeFim(code)
-        loss = trainStep(ids, labels)
+        loss, correct, tokens, exact = trainStep(ids, labels)
+        lossSum += loss
+        correctSum += correct
+        tokenSum += tokens
+        emSum += int(exact)
         if (step + 1) % ACCUM == 0:
             gradNorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
-            print(f"Step {step+1}, Loss {loss:.4f}")
-            wb.log({"loss": loss, "lr": sched.get_last_lr()[0],
-                    "grad_norm": gradNorm.item(), "seq_len": len(ids)}, step=step + 1)
+            acc = 100 * correctSum / max(tokenSum, 1)
+            print(f"Step {stepBase + step + 1}, Loss {lossSum / ACCUM:.4f}, Acc {acc:.2f}%")
+            wb.log({"loss": lossSum / ACCUM, "loss_last": loss, "lr": sched.get_last_lr()[0],
+                    "grad_norm": gradNorm.item(), "seq_len": len(ids),
+                    "token_acc": acc, "exact_match": 100 * emSum / ACCUM}, step=stepBase + step + 1)
+            lossSum, correctSum, tokenSum, emSum = 0.0, 0, 0, 0
         if step % 1000 == 999:
             peft.save_pretrained("out/lora")
