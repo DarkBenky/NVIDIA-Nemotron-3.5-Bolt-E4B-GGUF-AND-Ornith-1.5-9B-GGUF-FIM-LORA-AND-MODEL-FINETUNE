@@ -8,3 +8,5 @@ wandb: Run `wandb offline` to turn off syncing.
 wandb: Resuming run drawn-shadow-3
 wandb: ⭐️ View project at https://wandb.ai/darkbenky/nemotron-fim-lora
 wandb: 🚀 View run at https://wandb.ai/darkbenky/nemotron-fim-lora/runs/ivdoufle
+/home/user/miniconda3/lib/python3.14/multiprocessing/resource_tracker.py:475: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/loky-27248-x7rkfhgj'}
+  warnings.warn(

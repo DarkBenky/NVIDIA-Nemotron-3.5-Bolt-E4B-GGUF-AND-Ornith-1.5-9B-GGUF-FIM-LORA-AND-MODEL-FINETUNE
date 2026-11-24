@@ -2,3 +2,4 @@ env.py
 out/
 __pycache__/
 wandb/
+*.log
