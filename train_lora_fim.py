@@ -13,15 +13,20 @@ FIM_PRE, FIM_SUF, FIM_MID = UNUSED_TOKENS[:3]
 BASE = MODEL_PATH_SAVE_TENSOR
 FIM_LEN = 4096
 MAXLEN = FIM_LEN
-# token budgets, not char budgets: chars per token swings ~2x between files, so a fixed
-# character window still produced 132..4096-token samples and dragged the loss with it
+# token budgets, not char budgets: chars per token swings ~2x between files
 FIM_NEED = MAXLEN - 5
-# real /infill traffic fills a median of 2 tokens (p90 10, p99 128), so the hole is sampled
-# log-uniform: most samples teach short inserts, the tail still teaches long boilerplate fills
-FIM_HOLE_MIN, FIM_HOLE_MAX = 2, 256
+FIM_MIN = 256
+# real /infill fills a median of 2 tokens, but FIM training standard (SantaCoder/BigCode) splits
+# documents with uniformly random cut points, giving ~1200-token spans. Mix both: short inserts
+# for autocomplete, random spans so suffix attention is actually exercised
+FIM_HOLE_SHORT = 0.50    # share landing in 2-16 tokens
+FIM_HOLE_MED = 0.25      # share landing in 17-256 tokens; the rest is a standard random span
 ACCUM = 16
 SHUFFLE = 256
 SAVE_EVERY = 200
+VALID_DIR = "/home/user/Desktop/fimTester/testcorpus"
+VAL_SAMPLES = 160
+VAL_EVERY = ACCUM * 50
 EXT = (".c", ".h", ".go", ".py", ".vue", ".sql", ".js", ".ts", ".html", ".cpp", ".rs")
 
 def loadBase(check=True):
@@ -31,7 +36,7 @@ def loadBase(check=True):
         x = tok("def fibonacci(n):", return_tensors="pt").to("cuda")
         out = model.generate(**x, max_new_tokens=60, do_sample=False)
         print(tok.decode(out[0]))
-    # text-only training: the official checkpoint also carries vision/audio towers we never call
+    # text-only: skip the vision/audio towers the checkpoint also carries
     for name in ("vision_tower", "audio_tower", "embed_vision", "embed_audio"):
         if hasattr(model.model, name):
             delattr(model.model, name)
@@ -55,14 +60,24 @@ peft = (PeftModel.from_pretrained(model, os.environ["RESUME_LORA"], is_trainable
 peft.print_trainable_parameters()
 peft.train()  # GradientCheckpointingLayer only checkpoints when self.training, and from_pretrained returns eval mode
 
+LR_PEAK = float(os.environ.get("LR_PEAK", "2e-4"))
+LR_TAIL = int(os.environ.get("LR_TAIL", "0"))
+CLIP = float(os.environ.get("CLIP", "2.5"))
+
 params = [p for p in peft.parameters() if p.requires_grad]
-opt = torch.optim.AdamW(params, lr=2e-4, weight_decay=0.0)
-sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 50))
+opt = torch.optim.AdamW(params, lr=LR_PEAK, weight_decay=0.0)
+
+def lrScale(s):
+    if s < 50:
+        return (s + 1) / 50
+    if LR_TAIL <= 0:
+        return 1.0
+    return 0.5 * (1 + math.cos(math.pi * min(1.0, (s - 50) / LR_TAIL)))
+
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lrScale)
 
 def chunkLoss(h, w, labels, chunk=512):
-    # a chunk of C costs C*vocab*4 bytes three times over (logits, log_softmax, grad): 2048 -> ~6 GB spike
-    # total starts as a graph-connected zero: an all-masked sample leaves it untouched, and a plain 0.0
-    # would make backward() fail because a float has no grad
+    # starts as a graph-connected zero so an all-masked sample still has a grad path
     total, count, correct, exact = h.sum() * 0, 0, 0, True
     def f(hh, yy):
         logits = (hh @ w.T).float()
@@ -83,8 +98,58 @@ def chunkLoss(h, w, labels, chunk=512):
         count += n
     return total / max(count, 1), correct, count, exact
 
+def loadValid():
+    samples = []
+    for lang in sorted(os.listdir(VALID_DIR)):
+        d = os.path.join(VALID_DIR, lang)
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            lines = open(os.path.join(d, name), errors="ignore").read().split("\n")
+            for start, span in ((len(lines) // 4, 1), (len(lines) // 4, 3), (len(lines) // 2, 1),
+                                (len(lines) // 2, 3), (3 * len(lines) // 4, 1), (3 * len(lines) // 4, 3)):
+                md = tok("\n".join(lines[start:start + span]), add_special_tokens=False)["input_ids"]
+                pf = tok("\n".join(lines[:start]), add_special_tokens=False)["input_ids"]
+                sf = tok("\n".join(lines[start + span:]), add_special_tokens=False)["input_ids"]
+                if not md or len(pf) < 8 or len(sf) < 4:
+                    continue
+                labels = [-100] * (4 + len(pf) + len(sf)) + md + [tok.eos_token_id]
+                samples.append(([tok.bos_token_id, PRE_ID] + pf + [SUF_ID] + sf + [MID_ID] + md + [tok.eos_token_id], labels))
+    random.Random(0).shuffle(samples)
+    return samples[:VAL_SAMPLES]
+
+@torch.no_grad()
+def validStep(valid):
+    wasTraining = backbone.training
+    backbone.eval()
+    loss, count, hit, exact, eosP = 0.0, 0, 0, 0, 0.0
+    for ids, labels in valid:
+        h = backbone(input_ids=torch.tensor([ids]).cuda()).last_hidden_state[0]
+        y = torch.tensor(labels[1:] + [-100]).cuda()
+        ok = True
+        for i in range(0, h.size(0), 512):
+            yi = y[i:i + 512]
+            if not (yi != -100).any():
+                continue
+            logits = (h[i:i + 512] @ headW.T).float()
+            if cap:
+                logits = torch.tanh(logits / cap) * cap
+            loss += float(torch.nn.functional.cross_entropy(logits, yi, ignore_index=-100, reduction="sum"))
+            pred = logits.argmax(-1)
+            hit += int(((pred == yi) & (yi != -100)).sum())
+            count += int((yi != -100).sum())
+            ok = ok and bool(((pred == yi) | (yi == -100)).all())
+            j = h.size(0) - 2   # -2 breaks when the last chunk is size 1, so index the absolute position instead
+            if i <= j < i + logits.size(0):
+                eosP += float(torch.softmax(logits[j - i], -1)[tok.eos_token_id])
+        exact += int(ok)
+    backbone.train(wasTraining)
+    n = max(len(valid), 1)
+    return {"val_loss": loss / max(count, 1), "val_acc": 100 * hit / max(count, 1),
+            "val_em": 100 * exact / n, "val_eos_p": eosP / n}
+
 def codeStream():
-    # the dataset arrives repo by repo, so a small buffer shuffle breaks the long runs of similar files
+    # files arrive repo by repo, so shuffle within a buffer to break up similar runs
     ds = load_dataset("HuggingFaceCode/stack-v3-train", split="train", streaming=True, token=HF_TOKEN)
     buf = []
     for repo in ds:
@@ -93,7 +158,7 @@ def codeStream():
             if not (code and (f.get("file_path") or "").endswith(EXT) and len(code) < 60000):
                 continue
             ids = tok(code, add_special_tokens=False)["input_ids"]
-            if len(ids) < FIM_NEED:
+            if len(ids) < FIM_MIN:
                 continue
             buf.append(ids[:2 * FIM_NEED])
             if len(buf) >= SHUFFLE:
@@ -104,16 +169,24 @@ def codeStream():
 PRE_ID, SUF_ID, MID_ID = (tok.convert_tokens_to_ids(t) for t in (FIM_PRE, FIM_SUF, FIM_MID))
 
 def makeFim(ids):
-    # the hole varies like real traffic but the total length stays exactly MAXLEN, so a loss
-    # spike can only mean difficulty, never a longer window
-    start = random.randint(0, len(ids) - FIM_NEED)
-    w = ids[start:start + FIM_NEED]
-    hole = int(2 ** random.uniform(math.log2(FIM_HOLE_MIN), math.log2(FIM_HOLE_MAX)))
-    cut = random.randint(FIM_NEED // 3, FIM_NEED - hole - 1)
+    wlen = min(len(ids), int(2 ** random.uniform(math.log2(FIM_MIN), math.log2(FIM_NEED))))
+    start = random.randint(0, len(ids) - wlen)
+    w = ids[start:start + wlen]
+    u = random.random()
+    if u < FIM_HOLE_SHORT:
+        hole = int(2 ** random.uniform(1, 4))
+    elif u < FIM_HOLE_SHORT + FIM_HOLE_MED:
+        hole = int(2 ** random.uniform(math.log2(17), 8))
+    else:
+        a, b = sorted(random.sample(range(wlen), 2))
+        hole = b - a
+    lo = min(64, wlen // 4)
+    hole = min(hole, wlen - 2 * lo)
+    cut = random.randint(lo, wlen - hole - lo)
     pf, mid, sf = w[:cut], w[cut:cut + hole], w[cut + hole:]
     out = [tok.bos_token_id, PRE_ID] + pf + [SUF_ID] + sf + [MID_ID] + mid + [tok.eos_token_id]
     labels = [-100] * (4 + len(pf) + len(sf)) + mid + [tok.eos_token_id]
-    return out, labels
+    return out, labels, hole
 
 def trainStep(ids, labels):
     ids = torch.tensor([ids]).cuda()
@@ -128,24 +201,43 @@ if __name__ == "__main__":
     stepBase = int(os.environ.get("STEP_OFFSET", 0))
     wb.init(project="nemotron-fim-lora", id=runId, resume="allow" if runId else None)
     print("Starting training...")
+    valid = loadValid()
+    print(f"validation set: {len(valid)} held-out holes")
     lossSum, correctSum, tokenSum, emSum = 0.0, 0, 0, 0
+    holeBuf = []
     for step, doc in enumerate(codeStream()):
-        ids, labels = makeFim(doc)
+        ids, labels, hole = makeFim(doc)
+        holeBuf.append(hole)
         loss, correct, nTok, exact = trainStep(ids, labels)
         lossSum += loss
         correctSum += correct
         tokenSum += nTok
         emSum += int(exact)
         if (step + 1) % ACCUM == 0:
-            gradNorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+            gradNorm = torch.nn.utils.clip_grad_norm_(params, CLIP)
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
             acc = 100 * correctSum / max(tokenSum, 1)
             print(f"Step {stepBase + step + 1}, Loss {lossSum / ACCUM:.4f}, Acc {acc:.2f}%")
+            hs = sorted(holeBuf)
             wb.log({"loss": lossSum / ACCUM, "loss_last": loss, "lr": sched.get_last_lr()[0],
                     "grad_norm": gradNorm.item(), "seq_len": len(ids),
-                    "token_acc": acc, "exact_match": 100 * emSum / ACCUM}, step=stepBase + step + 1)
+                    "token_acc": acc, "exact_match": 100 * emSum / ACCUM,
+                    "hole_mean": sum(hs) / len(hs),
+                    "hole_med": hs[len(hs) // 2],
+                    "hole_p90": hs[int(len(hs) * 0.9)],
+                    "hole_le4_pct": 100 * sum(1 for h in hs if h <= 4) / len(hs),
+                    "hole_ge64_pct": 100 * sum(1 for h in hs if h >= 64) / len(hs)}, step=stepBase + step + 1)
+            if (step + 1) % VAL_EVERY == 0:
+                v = validStep(valid)
+                wb.log(v, step=stepBase + step + 1)
+                print(f"  val loss {v['val_loss']:.4f}, acc {v['val_acc']:.2f}%, em {v['val_em']:.1f}%, p_eos {v['val_eos_p']:.3f}")
+            if LR_TAIL > 0 and sched.last_epoch >= 50 + LR_TAIL:
+                peft.save_pretrained("out/lora")
+                print(f"LR tail finished at step {stepBase + step + 1}, stopping")
+                break
             lossSum, correctSum, tokenSum, emSum = 0.0, 0, 0, 0
+            holeBuf = []
         if step % SAVE_EVERY == SAVE_EVERY - 1:
             peft.save_pretrained("out/lora")
