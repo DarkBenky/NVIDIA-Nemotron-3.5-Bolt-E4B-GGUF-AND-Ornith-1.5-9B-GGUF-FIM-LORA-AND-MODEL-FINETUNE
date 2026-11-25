@@ -241,3 +241,5 @@ if __name__ == "__main__":
             holeBuf = []
         if step % SAVE_EVERY == SAVE_EVERY - 1:
             peft.save_pretrained("out/lora")
+    
+    print("Training finished.")
