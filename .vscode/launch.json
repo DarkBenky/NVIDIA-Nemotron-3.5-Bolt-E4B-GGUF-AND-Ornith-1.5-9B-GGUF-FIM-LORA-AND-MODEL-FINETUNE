@@ -1,0 +1,24 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [],
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "cwd": "/home/user/Desktop/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF-FIM-LORA-AND-MODEL-FINETUNE/bench/aider/tmp.benchmarks/polyglot-benchmark/cpp/exercises/practice/all-your-base",
+      "program": "/home/user/Desktop/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF-FIM-LORA-AND-MODEL-FINETUNE/bench/aider/tmp.benchmarks/polyglot-benchmark/cpp/exercises/practice/all-your-base/build/Debug/outDebug",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}
