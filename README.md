@@ -165,6 +165,21 @@ The tail cut `val_loss` by 28% and lifted the stop probability 45x while leaving
 token accuracy flat — the adapter became better calibrated rather than more
 accurate. `val_em` has never left 0%: it does not reproduce a whole hole exactly.
 
+### Deployment A/B (fimTester, 440 holes x 5 arms, DeepSeek judge)
+
+| arm | base | adapter | protocol | judge | sim_char | syntax | median ms |
+|---|---|---|---|---|---|---|---|
+| A | UD-Q4_K_XL | — | chat shim | 1.46 | 0.356 | 32.7% | 651 |
+| B | Q4_K_M | — | chat shim | 0.01 | 0.129 | 12.4% | 2949 |
+| C | Q4_K_M | — | native | 0.10 | 0.179 | 17.7% | 2675 |
+| D | Q4_K_M | final | native | 2.00 | 0.414 | 37.7% | 2619 |
+| E | UD + FIM keys | final | native | **2.31** | **0.437** | **43.4%** | 913 |
+
+A→B shows the chat shim only works on the UD quant; B→C that FIM tokens alone
+are inert without an adapter; C→D that the adapter is the entire effect. Paired
+E vs A on the same holes: mean +0.89, 119 wins / 66 losses, sign test p≈1e-4.
+The deployed setup is E.
+
 ## Building and deploying a GGUF
 
 ```bash
@@ -185,6 +200,23 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
 `3/4 * n_batch` and the suffix at `n_batch/4`, so `-b 16384` silently limits
 every prompt to ~12k tokens no matter how large `-c` is. Both caps maxed out at
 `-b 65536` overshoot the context by 2 tokens, hence 65520.
+
+### Currently deployed
+
+| file | role |
+|---|---|
+| `/media/user/2TB/Nemotron-Bolt-E4B-UD-fimkeys.gguf` | unsloth UD-Q4_K_XL + injected FIM keys |
+| `/media/user/2TB/nemotron-fim-lora-final.gguf` | adapter from run 3 (step 80640) |
+| `/media/user/2TB/nemotron-fim-lora-step75040.gguf` | previous adapter, kept for rollback |
+
+Both 8030 profiles point at these, so `/small/`, `/infill` and `/v1/completions`
+serve the adapter natively. `deploy_model.sh <gguf> <lora>` patches both units
+and makes timestamped `.bak-*` copies first.
+
+A wrong path in a unit shows up only as a systemd restart loop, so check
+`journalctl --user -u llama-server-zeta -n 20` after deploying. When another
+process holds the 3090 (Unsloth Studio takes ~17 GB), the router keeps the
+small model on the 3060 profile and chat overflows to DeepSeek.
 
 Measured on the RTX 3060 (Q4_K_M + LoRA, `-c 65536`): 4.5 GB VRAM, prefill
 ~1100-1270 t/s and decode ~35 t/s at 30k-50k token prompts, 2860 t/s and 88 t/s

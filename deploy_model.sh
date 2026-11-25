@@ -7,6 +7,13 @@ GGUF=${1:?usage: deploy_model.sh <gguf> <lora>}
 LORA=${2:?usage: deploy_model.sh <gguf> <lora>}
 STAMP=$(date +%Y%m%d)
 
+# a wrong path only shows up as a restart loop on the unit, so fail here instead
+for f in "$GGUF" "$LORA"; do
+    [ -r "$f" ] || { echo "not readable: $f" >&2; exit 1; }
+done
+head -c 4 "$GGUF" | grep -q GGUF || { echo "not a GGUF: $GGUF" >&2; exit 1; }
+head -c 4 "$LORA" | grep -q GGUF || { echo "not a GGUF: $LORA" >&2; exit 1; }
+
 for unit in llama-server-zeta llama-server-zeta-3060; do
     f="$HOME/.config/systemd/user/$unit.service"
     cp -a "$f" "$f.bak-$STAMP"
