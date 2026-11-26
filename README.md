@@ -91,18 +91,52 @@ Until a deployed GGUF has these keys, the 8031 proxy shims `/infill` into a
 chat turn ("Complete the missing code at `<CURSOR>`"), which costs accuracy
 against native FIM.
 
+Ornith is unaffected: its tokenizer already contains `<|fim_prefix|>`,
+`<|fim_suffix|>` and `<|fim_middle|>` as real special tokens (248060/248062/
+248061), which is one of the exact names llama.cpp looks for. `/infill` works on
+the stock GGUF with no conversion step.
+
 ## Training
 
-`train_lora_fim.py`, LoRA `r=128` on attention and MLP projections
-(279M of 7.74B params trainable), base = NVIDIA's official BF16 safetensors.
+Shared loop lives in `train_lora_fim_common.py`; each base model is a thin profile that only
+describes its differences:
+
+| file | base | FIM markers |
+|---|---|---|
+| `train_lora_fim_nemotrone.py` | Nemotron-3.5-Bolt-E4B BF16 | `<unused0>`..`<unused2>` (no FIM tokens in vocab) |
+| `train_lora_fim_ornith.py` | Ornith-1.5-9B BF16 (HF, 18G download) | `<\|fim_prefix\|>`, `<\|fim_suffix\|>`, `<\|fim_middle\|>` (already in the tokenizer) |
+
+LoRA `r=128` on attention and MLP projections (279M of 7.74B params trainable for Nemotron).
+`linear_attn` in Ornith's 24 linear-attention layers is deliberately left alone: llama.cpp's LoRA
+runtime only applies to plain linear layers, and the converter permutes V heads there.
+
+Ornith needs no FIM-token injection: llama.cpp auto-detects the markers by name, so `/infill`
+works on the base model out of the box.
 
 ```bash
-# fresh run
-python -u train_lora_fim.py
+# Nemotron
+python -u train_lora_fim_nemotrone.py
+
+# Ornith (downloads ~18G of BF16 safetensors on first run)
+python -u train_lora_fim_ornith.py
 
 # resume from a saved adapter, with a decaying LR tail that ends the run by itself
 RESUME_LORA=out/lora-step75040 WANDB_RUN_ID=<id> STEP_OFFSET=75040 \
-  LR_PEAK=3e-5 LR_TAIL=300 CLIP=2.5 python -u train_lora_fim.py
+  LR_PEAK=3e-5 LR_TAIL=300 CLIP=2.5 python -u train_lora_fim_nemotrone.py
+```
+
+`.cuda()` targets `cuda:0`, which without `CUDA_DEVICE_ORDER` is the **3090** (CUDA sorts by speed,
+not PCI). Both profiles refuse to start unless the card is nearly empty:
+
+| profile | required free |
+|---|---|
+| Nemotron (7.7B BF16) | 14 G |
+| Ornith (9B BF16) | 22 G |
+
+```bash
+systemctl --user stop llama-qwen-auto-router llama-server-zeta llama-server-zeta-3060 strata-iq3s
+python -u train_lora_fim_ornith.py
+systemctl --user start llama-qwen-auto-router   # brings the fast 7B back
 ```
 
 | env var | default | meaning |
@@ -110,9 +144,20 @@ RESUME_LORA=out/lora-step75040 WANDB_RUN_ID=<id> STEP_OFFSET=75040 \
 | `RESUME_LORA` | — | adapter directory to resume from |
 | `WANDB_RUN_ID` | — | wandb run to append to |
 | `STEP_OFFSET` | `0` | printed step offset for resumed runs |
-| `LR_PEAK` | `2e-4` | peak learning rate |
-| `LR_TAIL` | `0` | cosine-decay length in optimizer steps; `0` = flat LR, no auto-stop |
-| `CLIP` | `2.5` | gradient-norm clip |
+| `LR_PEAK` | `2e-4` (env.py) | peak learning rate |
+| `LR_TAIL` | `4990` (env.py) | cosine-decay length in optimizer steps; `0` = flat LR, no auto-stop |
+| `CLIP` | `2.5` (env.py) | gradient-norm clip |
+| `LORA_R` | `128` (env.py) | LoRA rank |
+| `LORA_ALPHA` | `128` (env.py) | LoRA alpha; keep equal to `LORA_R` for scale 1.0 |
+| `ACCUM` | `16` (env.py) | gradient accumulation; also sets the validation cadence |
+
+`LR_PEAK`, `LR_TAIL`, `CLIP`, `LORA_R`, `LORA_ALPHA` and `ACCUM` default to the values in `env.py`;
+setting the env var overrides them for one run. `LR_TAIL` is the decay length, not the total budget,
+so the run stops at `50 + LR_TAIL` optimizer steps (5040 with the default, i.e. raw step 80640).
+
+The run config also records `trainable_params` and `adapter_mib`, the size of the FP32 adapter that
+`save_pretrained` writes. `convert_lora_to_gguf.py` emits F16, so the GGUF llama.cpp actually loads
+is about half that.
 
 ### Sampling
 
@@ -227,7 +272,9 @@ sliding window and 18 KV layers are shared.
 
 | file | purpose |
 |---|---|
-| `train_lora_fim.py` | LoRA FIM training, sampling, validation, resume |
+| `train_lora_fim_common.py` | FIM sampling, loss, validation, LR schedule, wandb logging |
+| `train_lora_fim_nemotrone.py` | Nemotron profile: base path, `<unused*>` FIM markers |
+| `train_lora_fim_ornith.py` | Ornith profile: HF repo id, native FIM tokens, visual tower dropped |
 | `env.py` | paths and the `<unused*>` token list (gitignored: contains an HF token) |
 | `add_fim_tokens.py` | inject `tokenizer.ggml.fim_*_token_id` into an existing GGUF |
 
