@@ -2,7 +2,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import math, random, torch
-from datasets import load_dataset
+from datasets import interleave_datasets, load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer
@@ -29,6 +29,10 @@ VALID_DIR = "/home/user/Desktop/fimTester/testcorpus"
 VAL_SAMPLES = 160
 VAL_EVERY = ACCUM * 25
 EXT = (".c", ".h", ".go", ".py", ".vue", ".sql", ".js", ".ts", ".html", ".cpp", ".rs")
+# UltraData-Stack-v3-L2 is stack-v3-train filtered to ~20% of files and has one split per
+# language, so only the splits whose files can pass EXT are worth streaming. The weights are
+# how much of each language we actually write, not the corpus shares (go is 1.65% there)
+SPLITS = (("python", 0.225), ("javascript", 0.225), ("cpp", 0.225), ("go", 0.225), ("rust", 0.10))
 
 LR_PEAK = float(os.environ.get("LR_PEAK", LR_PEAK_DEFAULT))
 LR_TAIL = int(os.environ.get("LR_TAIL", LR_TAIL_DEFAULT))
@@ -194,20 +198,24 @@ def validStep(valid):
             "val_em": 100 * exact / n, "val_eos_p": eosP / n}
 
 def codeStream():
-    # files arrive repo by repo, so shuffle within a buffer to break up similar runs
-    ds = load_dataset("HuggingFaceCode/stack-v3-train", split="train", streaming=True, token=HF_TOKEN)
+    # this dataset has one row per file (not per repo) and one split per language, so the
+    # languages have to be interleaved by hand; within a language files still arrive repo by
+    # repo, so shuffle within a buffer to break up similar runs
+    names, probs = zip(*SPLITS)
+    ds = interleave_datasets([load_dataset("openbmb/UltraData-Stack-v3-L2", split=s, streaming=True,
+                                           token=HF_TOKEN) for s in names],
+                             probabilities=probs, seed=0)
     buf = []
-    for repo in ds:
-        for f in repo["files"]:
-            code = f.get("content")
-            if not (code and (f.get("file_path") or "").endswith(EXT) and len(code) < 60000):
-                continue
-            ids = tok(code, add_special_tokens=False)["input_ids"]
-            if len(ids) < FIM_MIN:
-                continue
-            buf.append(ids[:2 * FIM_NEED])
-            if len(buf) >= SHUFFLE:
-                yield buf.pop(random.randrange(len(buf)))
+    for f in ds:
+        code = f["content"]
+        if not (code and f["relative_path"].endswith(EXT) and len(code) < 60000):
+            continue
+        ids = tok(code, add_special_tokens=False)["input_ids"]
+        if len(ids) < FIM_MIN:
+            continue
+        buf.append(ids[:2 * FIM_NEED])
+        if len(buf) >= SHUFFLE:
+            yield buf.pop(random.randrange(len(buf)))
     random.shuffle(buf)
     yield from buf
 

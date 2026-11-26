@@ -145,8 +145,8 @@ systemctl --user start llama-qwen-auto-router   # brings the fast 7B back
 | `WANDB_RUN_ID` | — | wandb run to append to |
 | `STEP_OFFSET` | `0` | printed step offset for resumed runs |
 | `LR_PEAK` | `2e-4` (env.py) | peak learning rate |
-| `LR_TAIL` | `4990` (env.py) | cosine-decay length in optimizer steps; `0` = flat LR, no auto-stop |
-| `CLIP` | `2.5` (env.py) | gradient-norm clip |
+| `LR_TAIL` | `10000` (env.py) | cosine-decay length in optimizer steps; `0` = flat LR, no auto-stop |
+| `CLIP` | `2.75` (env.py) | gradient-norm clip |
 | `LORA_R` | `128` (env.py) | LoRA rank |
 | `LORA_ALPHA` | `128` (env.py) | LoRA alpha; keep equal to `LORA_R` for scale 1.0 |
 | `ACCUM` | `16` (env.py) | gradient accumulation; also sets the validation cadence |
@@ -255,8 +255,10 @@ every prompt to ~12k tokens no matter how large `-c` is. Both caps maxed out at
 | `/media/user/2TB/nemotron-fim-lora-step75040.gguf` | previous adapter, kept for rollback |
 
 Both 8030 profiles point at these, so `/small/`, `/infill` and `/v1/completions`
-serve the adapter natively. `deploy_model.sh <gguf> <lora>` patches both units
-and makes timestamped `.bak-*` copies first.
+serve the adapter natively. `scripts/deploy_model.sh <gguf> <lora>` patches both
+units and makes timestamped `.bak-*` copies first. Note it forces
+`--ctx-size 65536` / `--batch-size 65520`, which are Nemotron-era values — adjust
+if you deploy an Ornith adapter (its servers run 32768).
 
 A wrong path in a unit shows up only as a systemd restart loop, so check
 `journalctl --user -u llama-server-zeta -n 20` after deploying. When another
@@ -276,10 +278,13 @@ sliding window and 18 KV layers are shared.
 | `train_lora_fim_nemotrone.py` | Nemotron profile: base path, `<unused*>` FIM markers |
 | `train_lora_fim_ornith.py` | Ornith profile: HF repo id, native FIM tokens, visual tower dropped |
 | `env.py` | paths and the `<unused*>` token list (gitignored: contains an HF token) |
-| `add_fim_tokens.py` | inject `tokenizer.ggml.fim_*_token_id` into an existing GGUF |
+| `scripts/deploy_model.sh` | patch both zeta units to a GGUF + LoRA, with `.bak` copies |
+| `scripts/add_fim_tokens.py` | inject `tokenizer.ggml.fim_*_token_id` into an existing GGUF |
+| `logs/` | training logs (gitignored) |
+| `results/` | benchmark tables from the fimTester A/B runs |
 
-Adapters and logs are gitignored (`out/`, `wandb/`, `*.log`); checkpoints live
-in `out/lora*` on disk only.
+Adapters, logs and wandb runs are gitignored (`out/`, `logs/`, `wandb/`,
+`*.log`); checkpoints live in `out/lora*` on disk only.
 
 ## Suspending local routing during training
 
